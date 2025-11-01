@@ -1,0 +1,307 @@
+# scripts/etl.py
+"""
+ETL script for data_engineer_assessment.
+Reads the raw JSON file (one JSON object per row) from data/, transforms and loads into MySQL.
+Usage:
+  python etl.py --input data/properties.json --mysql-host 127.0.0.1 --mysql-user root --mysql-password example
+"""
+
+import argparse
+import json
+import hashlib
+import sys
+import os
+from datetime import datetime
+import pandas as pd
+import mysql.connector
+from mysql.connector import errorcode
+
+BATCH_SIZE = 500
+
+def checksum(s: str) -> str:
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+def connect_mysql(host, user, password, database='de_assessment', port=3306):
+    return mysql.connector.connect(
+        host=host, user=user, password=password, database=database, port=port,
+        autocommit=False
+    )
+
+def normalize_row(row: dict) -> dict:
+    """
+    Map fields from raw JSON to normalized fields.
+    Adjust this mapping to match your Field Config.xlsx.
+    """
+    # shallow mapping with safe defaults
+    mapped = {}
+    mapped['unique_id'] = row.get('id') or row.get('property_id') or row.get('uid')
+    mapped['property_type'] = row.get('property_type') or row.get('type')
+    mapped['year_built'] = row.get('year_built') or None
+    mapped['beds'] = row.get('beds') or row.get('bedrooms') or None
+    mapped['baths'] = row.get('baths') or row.get('bathrooms') or None
+    mapped['lot_size_sqft'] = row.get('lot_size') or row.get('lot_sqft') or None
+    mapped['living_area_sqft'] = row.get('living_area') or row.get('sqft') or None
+    mapped['listing_status'] = row.get('status') or None
+
+    # address
+    addr = {}
+    addr['street'] = row.get('street') or row.get('address')
+    addr['city'] = row.get('city')
+    addr['state'] = row.get('state')
+    addr['postal_code'] = row.get('zip') or row.get('postal_code')
+    addr['county'] = row.get('county')
+    addr['lat'] = row.get('lat')
+    addr['lon'] = row.get('lon')
+
+    # hoa
+    hoa = {}
+    hoa['name'] = row.get('hoa_name') or row.get('association')
+    hoa['dues_amount'] = row.get('hoa_dues') or row.get('dues_amount')
+    hoa['dues_frequency'] = row.get('hoa_dues_frequency')
+    hoa['amenities'] = row.get('hoa_amenities') or None
+
+    # valuations, rehab estimates lists
+    valuations = []
+    if row.get('valuation'):
+        v = row.get('valuation')
+        if isinstance(v, dict):
+            valuations.append(v)
+        elif isinstance(v, list):
+            valuations.extend(v)
+    if row.get('estimated_value'):
+        valuations.append({'valuation_date': row.get('valuation_date'), 'valuation_amount': row.get('estimated_value')})
+
+    rehab = []
+    if row.get('rehab_estimate'):
+        r = row.get('rehab_estimate')
+        if isinstance(r, dict):
+            rehab.append(r)
+        elif isinstance(r, list):
+            rehab.extend(r)
+
+    owners = []
+    o = row.get('owners') or row.get('owner')
+    if o:
+        if isinstance(o, list):
+            for owner in o:
+                owners.append(owner)
+        else:
+            owners.append(o)
+
+    return {
+        'mapped': mapped,
+        'address': addr,
+        'hoa': hoa,
+        'valuations': valuations,
+        'rehab': rehab,
+        'owners': owners,
+        'raw': row
+    }
+
+def insert_property(cur, mapped):
+    # try insert property; if unique_id exists, return existing id
+    unique_id = mapped.get('unique_id')
+    if unique_id:
+        # check if exists
+        cur.execute("SELECT id FROM property WHERE unique_id = %s", (unique_id,))
+        r = cur.fetchone()
+        if r:
+            return int(r[0])
+    # else insert
+    cur.execute("""
+        INSERT INTO property (unique_id, property_type, year_built, beds, baths, lot_size_sqft, living_area_sqft, listing_status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        mapped.get('unique_id'),
+        mapped.get('property_type'),
+        mapped.get('year_built'),
+        mapped.get('beds'),
+        mapped.get('baths'),
+        mapped.get('lot_size_sqft'),
+        mapped.get('living_area_sqft'),
+        mapped.get('listing_status')
+    ))
+    return cur.lastrowid
+
+def insert_address(cur, property_id, addr):
+    # upsert address by property_id (one-to-one)
+    cur.execute("SELECT id FROM address WHERE property_id = %s", (property_id,))
+    if cur.fetchone():
+        cur.execute("""
+            UPDATE address SET street=%s, city=%s, state=%s, postal_code=%s, county=%s, lat=%s, lon=%s, updated_at=NOW()
+            WHERE property_id=%s
+        """, (addr.get('street'), addr.get('city'), addr.get('state'), addr.get('postal_code'),
+              addr.get('county'), addr.get('lat'), addr.get('lon'), property_id))
+    else:
+        cur.execute("""
+            INSERT INTO address (property_id, street, city, state, postal_code, county, lat, lon)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (property_id, addr.get('street'), addr.get('city'), addr.get('state'), addr.get('postal_code'),
+              addr.get('county'), addr.get('lat'), addr.get('lon')))
+
+def insert_hoa(cur, hoa):
+    # basic dedupe by name
+    name = hoa.get('name')
+    if not name:
+        return None
+    cur.execute("SELECT id FROM hoa WHERE name = %s", (name,))
+    r = cur.fetchone()
+    if r:
+        return int(r[0])
+    cur.execute("""
+        INSERT INTO hoa (name, dues_amount, dues_frequency, amenities, contact)
+        VALUES (%s,%s,%s,%s,%s)
+    """, (name, hoa.get('dues_amount'), hoa.get('dues_frequency'), hoa.get('amenities'), hoa.get('contact')))
+    return cur.lastrowid
+
+def insert_owners(cur, property_id, owners):
+    for o in owners:
+        if isinstance(o, dict):
+            name = o.get('name') or o.get('owner_name')
+            email = o.get('email') or o.get('contact_email')
+            phone = o.get('phone') or o.get('contact_phone')
+            owner_type = o.get('type') or o.get('owner_type')
+        else:
+            name = str(o)
+            email = None
+            phone = None
+            owner_type = None
+        cur.execute("""
+            INSERT INTO owner (property_id, owner_name, owner_type, contact_email, contact_phone)
+            VALUES (%s,%s,%s,%s,%s)
+        """, (property_id, name, owner_type, email, phone))
+
+def insert_valuations(cur, property_id, valuations):
+    for v in valuations:
+        if not v:
+            continue
+        # try extract fields
+        amount = v.get('valuation_amount') or v.get('amount') or v.get('estimated_value')
+        date = v.get('valuation_date') or v.get('date')
+        try:
+            if date:
+                date = pd.to_datetime(date).date()
+        except Exception:
+            date = None
+        source = v.get('source') or v.get('source_name')
+        cur.execute("""
+            INSERT INTO valuation (property_id, valuation_date, valuation_amount, source)
+            VALUES (%s,%s,%s,%s)
+        """, (property_id, date, amount, source))
+
+def insert_rehab(cur, property_id, rehab_items):
+    for r in rehab_items:
+        if not r:
+            continue
+        amount = r.get('total_estimate') or r.get('estimate') or r.get('amount')
+        date = r.get('estimate_date') or r.get('date')
+        note = r.get('notes') or r.get('note') or None
+        try:
+            if date:
+                date = pd.to_datetime(date).date()
+        except Exception:
+            date = None
+        cur.execute("""
+            INSERT INTO rehab_estimate (property_id, estimate_date, total_estimate, notes)
+            VALUES (%s,%s,%s,%s)
+        """, (property_id, date, amount, note))
+
+def insert_source_meta(cur, property_id, raw_json_str, source_file):
+    csum = checksum(raw_json_str)
+    # simple insert (we keep raw history)
+    cur.execute("""
+        INSERT INTO source_meta (property_id, raw_json, source_file, checksum)
+        VALUES (%s,%s,%s,%s)
+    """, (property_id, raw_json_str, source_file, csum))
+
+def process_batch(conn, rows, source_file):
+    cur = conn.cursor()
+    try:
+        for row in rows:
+            norm = normalize_row(row)
+            mapped = norm['mapped']
+            addr = norm['address']
+            hoa = norm['hoa']
+            valuations = norm['valuations']
+            rehab = norm['rehab']
+            owners = norm['owners']
+            raw = norm['raw']
+
+            # insert property
+            property_id = insert_property(cur, mapped)
+
+            # insert or link HOA
+            hoa_id = None
+            if hoa and hoa.get('name'):
+                hoa_id = insert_hoa(cur, hoa)
+                # update property.hoa_id
+                if hoa_id:
+                    cur.execute("UPDATE property SET hoa_id=%s WHERE id=%s", (hoa_id, property_id))
+
+            # address
+            insert_address(cur, property_id, addr)
+
+            # owners
+            if owners:
+                insert_owners(cur, property_id, owners)
+
+            # valuations
+            if valuations:
+                insert_valuations(cur, property_id, valuations)
+
+            # rehab estimates
+            if rehab:
+                insert_rehab(cur, property_id, rehab)
+
+            # source meta
+            raw_str = json.dumps(raw, default=str)
+            insert_source_meta(cur, property_id, raw_str, source_file)
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+def main():
+    parser = argparse.ArgumentParser(description='ETL loader')
+    parser.add_argument('--input', required=True, help='Input JSON file (ndjson or JSON array)')
+    parser.add_argument('--mysql-host', default='127.0.0.1')
+    parser.add_argument('--mysql-user', default='root')
+    parser.add_argument('--mysql-password', default='example')
+    parser.add_argument('--mysql-port', type=int, default=3306)
+    parser.add_argument('--database', default='de_assessment')
+    args = parser.parse_args()
+
+    # read JSON (support NDJSON: one JSON object per line, or a JSON array)
+    input_path = args.input
+    rows = []
+    with open(input_path, 'r', encoding='utf-8') as f:
+        first = f.readline().strip()
+        f.seek(0)
+        if first.startswith('['):
+            # JSON array
+            rows = json.load(f)
+        else:
+            # NDJSON
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rows.append(json.loads(line))
+
+    # connect
+    conn = connect_mysql(args.mysql_host, args.mysql_user, args.mysql_password, database=args.database, port=args.mysql_port)
+    try:
+        # process in batches
+        for i in range(0, len(rows), BATCH_SIZE):
+            batch = rows[i:i+BATCH_SIZE]
+            print(f'Processing batch {i // BATCH_SIZE + 1} containing {len(batch)} rows...')
+            process_batch(conn, batch, os.path.basename(input_path))
+        print("ETL finished successfully.")
+    finally:
+        conn.close()
+
+if __name__ == '__main__':
+    main()
